@@ -1,3 +1,8 @@
+
+<img width="619" height="362" alt="Screenshot 2025-09-03 081117" src="https://github.com/user-attachments/assets/2e9fcbd8-ac93-4112-87e6-e3783a473b33" />
+
+
+
 # Safebox v2 — Windows GUI (pure Rust, hard‑coded key)
 A compact Windows application for encrypting/decrypting a single file with **one click**.  
 Built on the same engine as the CLI version: **atomic, streaming, authenticated** — now with a **file picker** and **drag‑and‑drop**.
