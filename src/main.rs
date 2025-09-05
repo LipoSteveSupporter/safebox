@@ -19,11 +19,16 @@ use zeroize::Zeroizing;
 
 /* =====================  Engine constants & key  ===================== */
 
-const MAGIC: &[u8; 4] = b"SBX2";           // format magic + version (v2 = pure-Rust)
-const ALGO_ID: u8 = 2;                     // XChaCha20-Poly1305 stream framing
-const SALT_LEN: usize = 16;                // per-file salt (for subkey derivation)
-const NONCE_BASE_LEN: usize = 16;          // file-level random prefix for nonces
-const CHUNK_SIZE: usize = 64 * 1024;       // plaintext chunk size
+const MAGIC: &[u8; 4] = b"SBX2"; // format magic + version (v2 = pure-Rust)
+const ALGO_ID: u8 = 2; // XChaCha20-Poly1305 stream framing
+const SALT_LEN: usize = 16; // per-file salt (for subkey derivation)
+const NONCE_BASE_LEN: usize = 16; // file-level random prefix for nonces
+const CHUNK_SIZE: usize = 64 * 1024; // plaintext chunk size
+
+// AEAD framing bounds (defense-in-depth; format-compatible):
+const AEAD_TAG_SIZE: usize = 16; // XChaCha20-Poly1305 tag size
+// Max ciphertext per frame: chunk + tag (final frame is just the tag)
+const MAX_FRAME_CIPHERTEXT: usize = CHUNK_SIZE + AEAD_TAG_SIZE;
 
 /// HARD-CODED MASTER KEY (DEFAULT) — REPLACE FOR REAL USE (64 hex chars = 32 bytes)
 const MASTER_KEY_HEX: &str =
@@ -46,7 +51,10 @@ impl LockGuard {
             .with_context(|| format!("open lock file {:?}", lock_path))?;
         file.try_lock_exclusive()
             .with_context(|| format!("failed to acquire lock on {:?}", lock_path))?;
-        Ok(Self { path: lock_path, file: Some(file) })
+        Ok(Self {
+            path: lock_path,
+            file: Some(file),
+        })
     }
 }
 impl Drop for LockGuard {
@@ -62,7 +70,10 @@ impl Drop for LockGuard {
 /* =====================  Public processing API  ===================== */
 
 #[derive(Clone, Copy, Debug)]
-enum Operation { Encrypted, Decrypted }
+enum Operation {
+    Encrypted,
+    Decrypted,
+}
 
 #[derive(Clone, Debug)]
 struct ProcessResult {
@@ -76,11 +87,17 @@ fn process_path(path: &Path) -> Result<ProcessResult> {
     match detect_action(path)? {
         Action::Encrypt => {
             encrypt_in_place(path)?;
-            Ok(ProcessResult { operation: Operation::Encrypted, path: path.to_owned() })
+            Ok(ProcessResult {
+                operation: Operation::Encrypted,
+                path: path.to_owned(),
+            })
         }
         Action::Decrypt => {
             decrypt_in_place(path)?;
-            Ok(ProcessResult { operation: Operation::Decrypted, path: path.to_owned() })
+            Ok(ProcessResult {
+                operation: Operation::Decrypted,
+                path: path.to_owned(),
+            })
         }
     }
 }
@@ -88,14 +105,19 @@ fn process_path(path: &Path) -> Result<ProcessResult> {
 /* =====================  Engine (encrypt/decrypt)  ===================== */
 
 #[derive(Clone, Copy, Debug)]
-enum Action { Encrypt, Decrypt }
+enum Action {
+    Encrypt,
+    Decrypt,
+}
 
 fn detect_action(path: &Path) -> Result<Action> {
     let mut f = File::open(path).with_context(|| format!("open {:?}", path))?;
     let mut buf = [0u8; 4];
     let n = f.read(&mut buf).with_context(|| "read magic failed")?;
     if n == 4 {
-        if &buf == MAGIC { return Ok(Action::Decrypt); }
+        if &buf == MAGIC {
+            return Ok(Action::Decrypt);
+        }
         if &buf == b"SBX1" {
             bail!("This file uses safebox v1 format (SBX1). Use the v1 build to decrypt first.");
         }
@@ -114,7 +136,10 @@ fn encrypt_in_place(path: &Path) -> Result<()> {
     let mut reader = BufReader::with_capacity(CHUNK_SIZE, src);
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = Builder::new().prefix(".safebox.").suffix(".tmp").tempfile_in(parent)
+    let tmp = Builder::new()
+        .prefix(".safebox.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
         .with_context(|| "create temp file")?;
     let tmp_path_buf = tmp.path().to_path_buf();
 
@@ -133,7 +158,8 @@ fn encrypt_in_place(path: &Path) -> Result<()> {
         let nonce_base = random_bytes::<NONCE_BASE_LEN>();
 
         // Header: [MAGIC(4)][ALGO_ID(1)][SALT_LEN(1)][SALT(16)][NB_LEN(1)][NONCE_BASE(16)]
-        let mut header = Vec::with_capacity(MAGIC.len() + 1 + 1 + SALT_LEN + 1 + NONCE_BASE_LEN);
+        let mut header =
+            Vec::with_capacity(MAGIC.len() + 1 + 1 + SALT_LEN + 1 + NONCE_BASE_LEN);
         header.extend_from_slice(MAGIC);
         header.push(ALGO_ID);
         header.push(SALT_LEN as u8);
@@ -146,11 +172,13 @@ fn encrypt_in_place(path: &Path) -> Result<()> {
         // Self-check hash
         let mut plain_hasher = B3Hasher::new();
 
-        let mut buf = vec![0u8; CHUNK_SIZE];
+        let mut buf = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
         let mut counter: u64 = 0;
         loop {
-            let n = reader.read(&mut buf).context("read source")?;
-            if n == 0 { break; }
+            let n = reader.read(&mut buf[..]).context("read source")?;
+            if n == 0 {
+                break;
+            }
             plain_hasher.update(&buf[..n]);
 
             let nonce = make_nonce(&nonce_base, counter);
@@ -160,7 +188,9 @@ fn encrypt_in_place(path: &Path) -> Result<()> {
                 .encrypt(&nonce, Payload { msg: &buf[..n], aad: &aad })
                 .map_err(|_| anyhow::anyhow!("encryption failed"))?;
             write_frame(&mut writer, FrameType::Data, counter, &ct)?;
-            counter = counter.checked_add(1).ok_or_else(|| anyhow::anyhow!("chunk counter overflow"))?;
+            counter = counter
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("chunk counter overflow"))?;
         }
 
         // Final frame
@@ -199,27 +229,35 @@ fn decrypt_in_place(path: &Path) -> Result<()> {
     let atime = FileTime::from_last_access_time(&meta);
 
     let src = File::open(path).with_context(|| format!("open {:?}", path))?;
-    let mut reader = BufReader::new(src);
+    let mut reader = BufReader::with_capacity(MAX_FRAME_CIPHERTEXT, src);
 
     // Header
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic).context("read magic")?;
-    if &magic != MAGIC { bail!("not a safebox v2 file (bad magic)"); }
+    if &magic != MAGIC {
+        bail!("not a safebox v2 file (bad magic)");
+    }
 
     let mut algo = [0u8; 1];
     reader.read_exact(&mut algo)?;
-    if algo[0] != ALGO_ID { bail!("unsupported algo id"); }
+    if algo[0] != ALGO_ID {
+        bail!("unsupported algo id");
+    }
 
     let mut saltlen = [0u8; 1];
     reader.read_exact(&mut saltlen)?;
-    if saltlen[0] as usize != SALT_LEN { bail!("unsupported salt length"); }
+    if saltlen[0] as usize != SALT_LEN {
+        bail!("unsupported salt length");
+    }
 
     let mut salt = vec![0u8; SALT_LEN];
     reader.read_exact(&mut salt)?;
 
     let mut nb_len = [0u8; 1];
     reader.read_exact(&mut nb_len)?;
-    if nb_len[0] as usize != NONCE_BASE_LEN { bail!("unsupported nonce base length"); }
+    if nb_len[0] as usize != NONCE_BASE_LEN {
+        bail!("unsupported nonce base length");
+    }
     let mut nonce_base = vec![0u8; NONCE_BASE_LEN];
     reader.read_exact(&mut nonce_base)?;
 
@@ -231,7 +269,8 @@ fn decrypt_in_place(path: &Path) -> Result<()> {
     let cipher = XChaCha20Poly1305::new(key);
 
     // AAD header bytes
-    let mut header = Vec::with_capacity(MAGIC.len() + 1 + 1 + SALT_LEN + 1 + NONCE_BASE_LEN);
+    let mut header =
+        Vec::with_capacity(MAGIC.len() + 1 + 1 + SALT_LEN + 1 + NONCE_BASE_LEN);
     header.extend_from_slice(&magic);
     header.extend_from_slice(&algo);
     header.extend_from_slice(&saltlen);
@@ -241,7 +280,10 @@ fn decrypt_in_place(path: &Path) -> Result<()> {
 
     // Temp plaintext
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = Builder::new().prefix(".safebox.").suffix(".tmp").tempfile_in(parent)
+    let tmp = Builder::new()
+        .prefix(".safebox.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
         .with_context(|| "create temp file")?;
     let mut writer = BufWriter::new(tmp.as_file());
 
@@ -253,34 +295,48 @@ fn decrypt_in_place(path: &Path) -> Result<()> {
             Ok(Some((ftype, counter, ct))) => {
                 if ftype == FrameType::Data {
                     if counter != expected_counter {
-                        bail!("frame out of sequence (got {}, expected {})", counter, expected_counter);
+                        bail!(
+                            "frame out of sequence (got {}, expected {})",
+                            counter,
+                            expected_counter
+                        );
                     }
                     let nonce = make_nonce(slice_to_array_16(&nonce_base)?, counter);
                     let aad = frame_aad(&header, FrameType::Data, counter);
-                    let pt = cipher
-                        .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
-                        .map_err(|_| anyhow::anyhow!("authentication failed"))?;
-                    writer.write_all(&pt).context("write plaintext")?;
-                    hasher.update(&pt);
-                    expected_counter = expected_counter.checked_add(1).ok_or_else(|| anyhow::anyhow!("counter overflow"))?;
+                    let pt = Zeroizing::new(
+                        cipher
+                            .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
+                            .map_err(|_| anyhow::anyhow!("authentication failed"))?,
+                    );
+                    writer.write_all(&pt[..]).context("write plaintext")?;
+                    hasher.update(&pt[..]);
+                    expected_counter = expected_counter
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("counter overflow"))?;
                 } else {
                     if counter != expected_counter {
-                        bail!("final frame counter mismatch (got {}, expected {})", counter, expected_counter);
+                        bail!(
+                            "final frame counter mismatch (got {}, expected {})",
+                            counter,
+                            expected_counter
+                        );
                     }
                     let nonce = make_nonce(slice_to_array_16(&nonce_base)?, counter);
                     let aad = frame_aad(&header, FrameType::Final, counter);
-                    let pt = cipher
-                        .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
-                        .map_err(|_| anyhow::anyhow!("final frame authentication failed"))?;
+                    let pt = Zeroizing::new(
+                        cipher
+                            .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
+                            .map_err(|_| anyhow::anyhow!("final frame authentication failed"))?,
+                    );
                     if !pt.is_empty() {
                         bail!("final frame plaintext not empty");
                     }
                     // No trailing bytes allowed
                     let mut one = [0u8; 1];
                     match reader.read(&mut one) {
-                        Ok(0) => {},
+                        Ok(0) => {}
                         Ok(_) => bail!("trailing data after final frame"),
-                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {},
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
                         Err(e) => return Err(e).context("checking trailing data"),
                     }
                     break;
@@ -307,23 +363,41 @@ fn decrypt_in_place(path: &Path) -> Result<()> {
 
 /* =====================  Helpers (engine)  ===================== */
 
-fn self_verify_decrypt_hash(tmp_path: &Path, master_key: &[u8; 32], expected_plain_hash: &blake3::Hash) -> Result<()> {
-    let mut reader = BufReader::new(File::open(tmp_path)?);
+fn self_verify_decrypt_hash(
+    tmp_path: &Path,
+    master_key: &[u8; 32],
+    expected_plain_hash: &blake3::Hash,
+) -> Result<()> {
+    let mut reader =
+        BufReader::with_capacity(MAX_FRAME_CIPHERTEXT, File::open(tmp_path)?);
 
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
-    if &magic != MAGIC { bail!("self-verify: bad magic"); }
+    if &magic != MAGIC {
+        bail!("self-verify: bad magic");
+    }
 
-    let mut algo = [0u8; 1]; reader.read_exact(&mut algo)?;
-    if algo[0] != ALGO_ID { bail!("self-verify: bad algo id"); }
+    let mut algo = [0u8; 1];
+    reader.read_exact(&mut algo)?;
+    if algo[0] != ALGO_ID {
+        bail!("self-verify: bad algo id");
+    }
 
-    let mut saltlen = [0u8; 1]; reader.read_exact(&mut saltlen)?;
-    if saltlen[0] as usize != SALT_LEN { bail!("self-verify: bad salt length"); }
+    let mut saltlen = [0u8; 1];
+    reader.read_exact(&mut saltlen)?;
+    if saltlen[0] as usize != SALT_LEN {
+        bail!("self-verify: bad salt length");
+    }
 
-    let mut salt = vec![0u8; SALT_LEN]; reader.read_exact(&mut salt)?;
-    let mut nb_len = [0u8; 1]; reader.read_exact(&mut nb_len)?;
-    if nb_len[0] as usize != NONCE_BASE_LEN { bail!("self-verify: bad nonce base len"); }
-    let mut nonce_base = vec![0u8; NONCE_BASE_LEN]; reader.read_exact(&mut nonce_base)?;
+    let mut salt = vec![0u8; SALT_LEN];
+    reader.read_exact(&mut salt)?;
+    let mut nb_len = [0u8; 1];
+    reader.read_exact(&mut nb_len)?;
+    if nb_len[0] as usize != NONCE_BASE_LEN {
+        bail!("self-verify: bad nonce base len");
+    }
+    let mut nonce_base = vec![0u8; NONCE_BASE_LEN];
+    reader.read_exact(&mut nonce_base)?;
 
     let subkey_bytes = b3_keyed_derive(master_key, &salt);
     let subkey = Zeroizing::new(subkey_bytes);
@@ -345,20 +419,34 @@ fn self_verify_decrypt_hash(tmp_path: &Path, master_key: &[u8; 32], expected_pla
         match read_frame(&mut reader) {
             Ok(Some((ftype, counter, ct))) => {
                 if ftype == FrameType::Data {
-                    if counter != expected_counter { bail!("self-verify: sequence error"); }
+                    if counter != expected_counter {
+                        bail!("self-verify: sequence error");
+                    }
                     let nonce = make_nonce(slice_to_array_16(&nonce_base)?, counter);
                     let aad = frame_aad(&header, FrameType::Data, counter);
-                    let pt = cipher.decrypt(&nonce, Payload { msg: &ct, aad: &aad })
-                        .map_err(|_| anyhow::anyhow!("self-verify: auth failed"))?;
-                    hasher.update(&pt);
-                    expected_counter += 1;
+                    let pt = Zeroizing::new(
+                        cipher
+                            .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
+                            .map_err(|_| anyhow::anyhow!("self-verify: auth failed"))?,
+                    );
+                    hasher.update(&pt[..]);
+                    expected_counter = expected_counter
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("self-verify: counter overflow"))?;
                 } else {
-                    if counter != expected_counter { bail!("self-verify: final counter mismatch"); }
+                    if counter != expected_counter {
+                        bail!("self-verify: final counter mismatch");
+                    }
                     let nonce = make_nonce(slice_to_array_16(&nonce_base)?, counter);
                     let aad = frame_aad(&header, FrameType::Final, counter);
-                    let pt = cipher.decrypt(&nonce, Payload { msg: &ct, aad: &aad })
-                        .map_err(|_| anyhow::anyhow!("self-verify: final auth failed"))?;
-                    if !pt.is_empty() { bail!("self-verify: final not empty"); }
+                    let pt = Zeroizing::new(
+                        cipher
+                            .decrypt(&nonce, Payload { msg: &ct, aad: &aad })
+                            .map_err(|_| anyhow::anyhow!("self-verify: final auth failed"))?,
+                    );
+                    if !pt.is_empty() {
+                        bail!("self-verify: final not empty");
+                    }
                     break;
                 }
             }
@@ -368,13 +456,18 @@ fn self_verify_decrypt_hash(tmp_path: &Path, master_key: &[u8; 32], expected_pla
     }
 
     let got = hasher.finalize();
-    if &got != expected_plain_hash { bail!("self-verify: plaintext hash mismatch"); }
+    if &got != expected_plain_hash {
+        bail!("self-verify: plaintext hash mismatch");
+    }
     Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-enum FrameType { Data = 0x00, Final = 0xFF }
+enum FrameType {
+    Data = 0x00,
+    Final = 0xFF,
+}
 impl TryFrom<u8> for FrameType {
     type Error = anyhow::Error;
     fn try_from(v: u8) -> Result<Self> {
@@ -387,7 +480,9 @@ impl TryFrom<u8> for FrameType {
 }
 
 fn write_frame<W: Write>(writer: &mut W, ftype: FrameType, counter: u64, ct: &[u8]) -> Result<()> {
-    if ct.len() > u32::MAX as usize { bail!("frame too large"); }
+    if ct.len() > u32::MAX as usize {
+        bail!("frame too large");
+    }
     writer.write_all(&[ftype as u8])?;
     writer.write_all(&counter.to_be_bytes())?;
     writer.write_all(&(ct.len() as u32).to_be_bytes())?;
@@ -408,10 +503,18 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<(FrameType, u64, Vec<u8>
         }
     }
     let ftype = FrameType::try_from(hdr[0])?;
-    let mut cnt = [0u8; 8]; cnt.copy_from_slice(&hdr[1..9]);
+    let mut cnt = [0u8; 8];
+    cnt.copy_from_slice(&hdr[1..9]);
     let counter = u64::from_be_bytes(cnt);
-    let mut lenb = [0u8; 4]; lenb.copy_from_slice(&hdr[9..13]);
+    let mut lenb = [0u8; 4];
+    lenb.copy_from_slice(&hdr[9..13]);
     let clen = u32::from_be_bytes(lenb) as usize;
+
+    // Defensive bounds: each ciphertext frame must at least carry the AEAD tag,
+    // and must not exceed our known writer's maximum frame size.
+    if clen < AEAD_TAG_SIZE || clen > MAX_FRAME_CIPHERTEXT {
+        bail!("invalid frame length: {}", clen);
+    }
 
     let mut ct = vec![0u8; clen];
     reader.read_exact(&mut ct).context("read frame body")?;
@@ -429,7 +532,9 @@ fn load_master_key() -> Result<[u8; 32]> {
 
 fn decode_key_hex(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s.trim()).context("hex decode")?;
-    if bytes.len() != 32 { bail!("key must be 32 bytes (64 hex chars)"); }
+    if bytes.len() != 32 {
+        bail!("key must be 32 bytes (64 hex chars)");
+    }
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(out)
@@ -457,7 +562,9 @@ fn random_bytes<const N: usize>() -> [u8; N] {
 }
 
 fn slice_to_array_16(slice: &[u8]) -> Result<&[u8; 16]> {
-    slice.try_into().map_err(|_| anyhow::anyhow!("bad nonce base length"))
+    slice
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bad nonce base length"))
 }
 
 fn lock_path_for(path: &Path) -> PathBuf {
@@ -469,7 +576,9 @@ fn lock_path_for(path: &Path) -> PathBuf {
 
 fn sync_dir(_dir: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
-    { return Ok(()); }
+    {
+        return Ok(());
+    }
     #[cfg(not(target_os = "windows"))]
     {
         let d = File::open(_dir).with_context(|| format!("open dir {:?}", _dir))?;
@@ -481,7 +590,9 @@ fn sync_dir(_dir: &Path) -> Result<()> {
 /* =====================  GUI (egui/eframe)  ===================== */
 
 #[derive(Clone)]
-struct Job { path: PathBuf }
+struct Job {
+    path: PathBuf,
+}
 
 enum Msg {
     Started(PathBuf),
@@ -500,7 +611,8 @@ impl Default for App {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
-            tx, rx,
+            tx,
+            rx,
             in_progress: false,
             last_status: None,
             last_error: None,
@@ -510,7 +622,9 @@ impl Default for App {
 
 impl App {
     fn spawn_job(&mut self, job: Job) {
-        if self.in_progress { return; }
+        if self.in_progress {
+            return;
+        }
         self.in_progress = true;
         self.last_error = None;
         self.last_status = Some(format!("Processing {}", job.path.display()));
@@ -545,7 +659,8 @@ impl eframe::App for App {
                                 Operation::Encrypted => "Encrypted",
                                 Operation::Decrypted => "Decrypted",
                             };
-                            self.last_status = Some(format!("{} {}", what, done.path.display()));
+                            self.last_status =
+                                Some(format!("{} {}", what, done.path.display()));
                         }
                         Err(e) => {
                             self.last_error = Some(format!("{:#}", e));
@@ -571,7 +686,10 @@ impl eframe::App for App {
             ui.label("Choose a file to encrypt/decrypt. (Drag & drop also works.)");
             ui.add_space(10.0);
 
-            if ui.add_enabled(!self.in_progress, egui::Button::new("Select file…")).clicked() {
+            if ui
+                .add_enabled(!self.in_progress, egui::Button::new("Select file…"))
+                .clicked()
+            {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     self.spawn_job(Job { path });
                 }
@@ -583,7 +701,10 @@ impl eframe::App for App {
                 ui.colored_label(ui.visuals().hyperlink_color, s);
             }
             if let Some(e) = &self.last_error {
-                ui.colored_label(ui.visuals().error_fg_color, egui::RichText::new("Error").strong());
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    egui::RichText::new("Error").strong(),
+                );
                 ui.code(e);
             }
 
@@ -609,5 +730,9 @@ fn main() -> eframe::Result<()> {
         centered: true,
         ..Default::default()
     };
-    eframe::run_native("Safebox v2 — Encrypt/Decrypt", options, Box::new(|_| Box::<App>::default()))
+    eframe::run_native(
+        "Safebox v2 — Encrypt/Decrypt",
+        options,
+        Box::new(|_| Box::<App>::default()),
+    )
 }
